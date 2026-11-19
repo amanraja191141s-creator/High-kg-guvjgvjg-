@@ -1,0 +1,128 @@
+name: SA Calculator v99.0 — Rebuilt Android App
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sa-calculator-v99-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-and-build:
+    name: Verify clean v99.0 source and build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Locate exact v99.0 source (repository root or uploaded ZIP)
+        id: source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ -f package.json ]; then
+            VERSION="$(node -p "require('./package.json').version")"
+            if [ "$VERSION" != "1.99.0-v99.0" ]; then
+              echo "::error::Repository root is stale: expected 1.99.0-v99.0, found $VERSION"
+              exit 1
+            fi
+            APP_DIR="$GITHUB_WORKSPACE"
+          else
+            mapfile -t ARCHIVES < <(find . -maxdepth 4 -type f -name 'SA-Calculator-v99.0-Rebuilt.zip' -print)
+            if [ "${#ARCHIVES[@]}" -ne 1 ]; then
+              echo "::error::Upload the complete v99.0 ZIP or extract its contents into the repository root."
+              exit 1
+            fi
+            unzip -tq "${ARCHIVES[0]}"
+            EXTRACT_DIR="$RUNNER_TEMP/sa-calculator-v99.0"
+            rm -rf "$EXTRACT_DIR"
+            mkdir -p "$EXTRACT_DIR"
+            unzip -q "${ARCHIVES[0]}" -d "$EXTRACT_DIR"
+            mapfile -t MANIFESTS < <(find "$EXTRACT_DIR" -type f -name package.json -not -path '*/node_modules/*' -not -path '*/www/*')
+            if [ "${#MANIFESTS[@]}" -ne 1 ]; then
+              echo "::error::Expected exactly one application package.json in the ZIP."
+              exit 1
+            fi
+            APP_DIR="$(dirname "${MANIFESTS[0]}")"
+            VERSION="$(node -p "require(process.argv[1]).version" "$APP_DIR/package.json")"
+            if [ "$VERSION" != "1.99.0-v99.0" ]; then
+              echo "::error::ZIP contains wrong release: $VERSION"
+              exit 1
+            fi
+          fi
+          echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
+          echo "Selected exact source: $APP_DIR"
+
+      - name: Verify release identity, navigation and clean CSS source
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const html = fs.readFileSync('index.html', 'utf8');
+          const inv = JSON.parse(fs.readFileSync('design-reference/MASTER-SCREEN-INVENTORY-v99.0.json', 'utf8'));
+          if (p.name !== 'sa-calculator' || p.version !== '1.99.0-v99.0') throw new Error('Wrong package identity');
+          if (!html.includes(p.version)) throw new Error('HTML/package version mismatch');
+          if (inv.tool_count !== 17 || inv.primary_navigation.join(',') !== 'calc,tools,history,favorites,settings') throw new Error('Navigation/tool inventory mismatch');
+          const required = ['assets/css/app.css','assets/js/app.js','assets/js/localization.js','assets/js/currency-localized-names.js','assets/js/theme-bootstrap.js','scripts/prepare-android-web.mjs','scripts/patch-android-native.mjs','service-worker.js','manifest.webmanifest','capacitor.config.json'];
+          for (const f of required) if (!fs.existsSync(f) || !fs.statSync(f).size) throw new Error(`Missing required file: ${f}`);
+          if (fs.existsSync('assets/css/app-base.css') || fs.readdirSync('assets/css').some(f => /^rebuild-v.*\.css$/.test(f))) throw new Error('Legacy layered CSS sources remain in the clean release');
+          if ((html.match(/data-tool-screen=/g)||[]).length !== 17) throw new Error('Expected 17 unique tool cards');
+          console.log('v99.0 release, tool inventory and clean source structure verified.');
+          NODE
+
+      - name: Install dependencies
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        run: npm install --no-audit --no-fund
+
+      - name: Run regression suite
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        run: npm test
+
+      - name: Build deterministic Android web bundle
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        run: npm run build:web
+
+      - name: Add Android platform if not already present
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        shell: bash
+        run: |
+          if [ ! -d android ]; then npx cap add android; fi
+
+      - name: Apply native branding
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        run: npm run android:brand
+
+      - name: Build debug APK
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        run: npm run android:apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SA-Calculator-v99.0-debug-apk
+          path: ${{ steps.source.outputs.app_dir }}/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
